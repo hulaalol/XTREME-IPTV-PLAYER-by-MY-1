@@ -1,6 +1,8 @@
 import sys
 import os
 import time
+import uuid
+import hashlib
 import requests
 import subprocess
 import configparser
@@ -11,6 +13,7 @@ import html
 import os
 import ssl
 import urllib.request
+from urllib.parse import urlparse, parse_qs
 from PyQt5 import QtCore
 from PyQt5.QtWidgets import QToolTip
 from pathlib import Path
@@ -18,7 +21,7 @@ from lxml import etree
 from datetime import datetime
 from dateutil import parser, tz
 import xml.etree.ElementTree as ET
-from PyQt5.QtGui import QIcon, QFont
+from PyQt5.QtGui import QIcon, QFont, QBrush, QColor
 from PyQt5.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QObject, pyqtSignal, QRunnable, pyqtSlot, QThreadPool, QDir
 )
@@ -27,16 +30,27 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QLineEdit, QLabel, QPushButton,
     QListWidget, QWidget, QFileDialog, QCheckBox, QSizePolicy, QHBoxLayout,
     QDialog, QFormLayout, QDialogButtonBox, QTabWidget, QListWidgetItem,
-    QSpinBox, QMenu, QAction, QTextEdit, 
+    QSpinBox, QMenu, QAction, QTextEdit,
+    QStyledItemDelegate, QTreeWidget, QTreeWidgetItem, QAbstractItemView,
+    QInputDialog, QMessageBox, QStyle,
 )
 
 is_windows = sys.platform.startswith('win')
 is_mac = sys.platform.startswith('darwin')
 is_linux = sys.platform.startswith('linux')
 
-# EPG Cache File
-cache_file = Path.home() / '.iptv' / 'epg_cache1.xml'
-os.makedirs(cache_file.parent, exist_ok=True)
+# EPG cache directory: per-server XML files keyed by sha1(server_url).
+# Using the server URL (not the profile name) means two profiles pointing
+# at the same Xtream server share one EPG cache.
+EPG_DIR = Path.home() / '.iptv' / 'epg'
+os.makedirs(EPG_DIR, exist_ok=True)
+EPG_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
+EPG_REFRESH_INTERVAL_MS = 60 * 60 * 1000  # 60 min
+
+
+def _epg_cache_file_for(server_url):
+    safe = hashlib.sha1((server_url or "").encode("utf-8")).hexdigest()[:16]
+    return EPG_DIR / f"{safe}.xml"
 
 CUSTOM_USER_AGENT = (
     "Connection: Keep-Alive User-Agent: okhttp/5.0.0-alpha.2 "
@@ -56,22 +70,23 @@ class EPGWorkerSignals(QObject):
     error = pyqtSignal(str)
 
 class EPGWorker(QRunnable):
-    def __init__(self, server, username, password, http_method):
+    def __init__(self, server, username, password, http_method, cache_file_path):
         super().__init__()
         self.server = server
         self.username = username
         self.password = password
         self.http_method = http_method
+        self.cache_file_path = str(cache_file_path)
         self.signals = EPGWorkerSignals()
 
     @pyqtSlot()
     def run(self):
         try:
-            cache_file = 'epg_cache1.xml'
+            cache_file = self.cache_file_path
             cache_valid = False
             if os.path.exists(cache_file):
                 cache_age = time.time() - os.path.getmtime(cache_file)
-                if cache_age < 3600:  
+                if cache_age < EPG_CACHE_TTL_SECONDS:
                     cache_valid = True
 
             if cache_valid:
@@ -86,6 +101,7 @@ class EPGWorker(QRunnable):
                     response = requests.get(epg_url, headers=headers, timeout=10)
                 response.raise_for_status()
                 epg_xml_data = response.content
+                os.makedirs(os.path.dirname(cache_file) or ".", exist_ok=True)
                 with open(cache_file, 'wb') as f:
                     f.write(epg_xml_data)
 
@@ -140,10 +156,619 @@ class EPGWorker(QRunnable):
             print(f"Error parsing EPG data: {e}")
             return {}, {}
 
-class AddressBookDialog(QtWidgets.QDialog):
+
+import hashlib
+
+PLAYLIST_CACHE_DIR = Path.home() / '.iptv' / 'playlists'
+
+_EXTINF_RE = re.compile(r'#EXTINF:[^,]*,(.*)$')
+_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+_VOD_GROUP_RE = re.compile(r'\b(vod|movie|movies|film|films|cinema)\b', re.IGNORECASE)
+_SERIES_GROUP_RE = re.compile(r'\b(series|tv\s*shows?|shows?|seasons?)\b', re.IGNORECASE)
+_EPISODE_RE = re.compile(r'\bS\d{1,2}\s?E\d{1,3}\b', re.IGNORECASE)
+_MOVIE_EXT_RE = re.compile(r'\.(mp4|mkv|avi|mov|webm|flv|wmv)(\?|$)', re.IGNORECASE)
+
+
+def _classify_entry(group_title, name, url):
+    g = (group_title or "").strip()
+    if g:
+        if _SERIES_GROUP_RE.search(g):
+            return 'Series'
+        if _VOD_GROUP_RE.search(g):
+            return 'Movies'
+    if _EPISODE_RE.search(name or ""):
+        return 'Series'
+    if _MOVIE_EXT_RE.search(url or ""):
+        return 'Movies'
+    return 'LIVE'
+
+
+def _slug_id(text):
+    return hashlib.sha1(text.encode('utf-8')).hexdigest()[:12]
+
+
+def parse_m3u_file(path):
+    abs_path = os.path.abspath(path)
+    entries_by_cat = {}
+    groups_by_tab = {'LIVE': {}, 'Movies': {}, 'Series': {}}
+
+    pending = None  # dict built from #EXTINF, waiting for URL line
+    try:
+        with open(abs_path, 'r', encoding='utf-8-sig', errors='replace') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith('#EXTINF'):
+                    try:
+                        attrs = dict(_ATTR_RE.findall(line))
+                        m = _EXTINF_RE.match(line)
+                        display_name = m.group(1).strip() if m else attrs.get('tvg-name', '').strip()
+                        pending = {
+                            'name': display_name or attrs.get('tvg-name', '').strip() or 'Unnamed',
+                            'epg_channel_id': (attrs.get('tvg-id') or '').strip().lower() or None,
+                            'stream_icon': attrs.get('tvg-logo', '').strip(),
+                            'group_title': attrs.get('group-title', '').strip(),
+                            'container_extension': 'm3u8',
+                        }
+                    except Exception as ex:
+                        print(f"Skipping malformed #EXTINF: {ex}")
+                        pending = None
+                    continue
+                if line.startswith('#'):
+                    continue
+                # URL line
+                if pending is None:
+                    continue
+                try:
+                    url = line
+                    ext_m = re.search(r'\.([a-z0-9]{2,5})(?:\?|$)', url, re.IGNORECASE)
+                    if ext_m:
+                        pending['container_extension'] = ext_m.group(1).lower()
+                    pending['url'] = url
+                    group_title = pending.pop('group_title') or 'Uncategorized'
+                    tab = _classify_entry(group_title, pending.get('name', ''), url)
+                    key = f"{tab}||{group_title}"
+                    if group_title not in groups_by_tab[tab]:
+                        groups_by_tab[tab][group_title] = _slug_id(f"{tab}:{group_title}")
+                    entries_by_cat.setdefault(key, []).append(pending)
+                except Exception as ex:
+                    print(f"Skipping malformed M3U entry: {ex}")
+                finally:
+                    pending = None
+    except FileNotFoundError:
+        raise
+    except Exception as ex:
+        print(f"Error reading M3U file: {ex}")
+
+    groups = {
+        tab: [{'category_name': name, 'category_id': cid}
+              for name, cid in sorted(groups_by_tab[tab].items(), key=lambda kv: kv[0].lower())]
+        for tab in ('LIVE', 'Movies', 'Series')
+    }
+    return {
+        'groups': groups,
+        'entries_by_category': entries_by_cat,
+        'source_path': abs_path,
+        'source_mtime': os.path.getmtime(abs_path),
+        'parsed_at': time.time(),
+    }
+
+
+def load_or_parse_m3u_with_cache(path):
+    abs_path = os.path.abspath(path)
+    os.makedirs(PLAYLIST_CACHE_DIR, exist_ok=True)
+    cache_file = PLAYLIST_CACHE_DIR / f"{hashlib.sha1(abs_path.encode('utf-8')).hexdigest()[:16]}.json"
+
+    try:
+        src_mtime = os.path.getmtime(abs_path)
+    except OSError:
+        raise
+
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cached = json.load(f)
+            if (cached.get('source_path') == abs_path
+                    and cached.get('source_mtime') == src_mtime):
+                return cached
+        except Exception as ex:
+            print(f"Playlist cache read failed, re-parsing: {ex}")
+
+    parsed = parse_m3u_file(abs_path)
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(parsed, f)
+    except Exception as ex:
+        print(f"Playlist cache write failed: {ex}")
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Favorites: per-profile, persisted under ~/.iptv/favorites/<sha1(name)[:16]>.json
+# Note: file is keyed by sha1 of the profile NAME. If the user renames a
+# profile in credentials.ini, the saved favorites become orphaned.
+# ---------------------------------------------------------------------------
+
+FAVORITES_DIR = Path.home() / '.iptv' / 'favorites'
+
+ROLE_STARRABLE = Qt.UserRole + 1
+ROLE_EPG_TEXT = Qt.UserRole + 2
+ROLE_NODE_ID = Qt.UserRole
+ROLE_NODE_KIND = Qt.UserRole + 1
+
+
+def _favorites_file_for(name):
+    safe = hashlib.sha1((name or "").encode("utf-8")).hexdigest()[:16]
+    return FAVORITES_DIR / f"{safe}.json"
+
+
+def _empty_favorites_tree():
+    return {
+        "version": 1,
+        "root": {
+            "id": str(uuid.uuid4()),
+            "type": "group",
+            "name": "Favorites",
+            "children": [],
+        },
+    }
+
+
+def _walk_tree(node, fn):
+    fn(node)
+    if node.get("type") == "group":
+        for child in node.get("children", []):
+            _walk_tree(child, fn)
+
+
+def _find_node(root, node_id):
+    """Return (parent, node, index_in_parent) or None. parent is None for root."""
+    if root.get("id") == node_id:
+        return (None, root, -1)
+
+    def search(parent):
+        for i, child in enumerate(parent.get("children", [])):
+            if child.get("id") == node_id:
+                return (parent, child, i)
+            if child.get("type") == "group":
+                hit = search(child)
+                if hit is not None:
+                    return hit
+        return None
+
+    return search(root)
+
+
+def _remove_node(root, node_id):
+    found = _find_node(root, node_id)
+    if found is None or found[0] is None:
+        return None
+    parent, node, idx = found
+    parent["children"].pop(idx)
+    return node
+
+
+def _atomic_write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+class FavoritesStarDelegate(QStyledItemDelegate):
+    STAR_BOX = 22
+    STAR_GAP = 8     # gap between EPG text and star
+    EPG_GAP = 12     # gap between channel name and EPG text
+    STAR_SOLID = "★"
+    STAR_HOLLOW = "☆"
+
+    def __init__(self, app, source_tab, parent=None):
+        super().__init__(parent)
+        self._app = app
+        self._source_tab = source_tab
+
+    def _star_rect(self, option):
+        from PyQt5.QtCore import QRect
+        rect = option.rect
+        size = self.STAR_BOX
+        x = rect.right() - size - 4
+        y = rect.top() + (rect.height() - size) // 2
+        return QRect(x, y, size, size)
+
+    def _reserved_right_width(self, index):
+        """Total width to subtract from text area for star + EPG column."""
+        w = 0
+        if index.data(ROLE_STARRABLE):
+            w += self.STAR_BOX + 4
+        if index.data(ROLE_EPG_TEXT):
+            # EPG column gets up to 45% of row width, capped at 360px
+            row_w = max(0, w)  # placeholder; actual cap computed in paint where rect is known
+        return w
+
+    def sizeHint(self, option, index):
+        sh = super().sizeHint(option, index)
+        if index.data(ROLE_STARRABLE):
+            sh.setWidth(sh.width() + self.STAR_BOX + 6)
+        return sh
+
+    def paint(self, painter, option, index):
+        from PyQt5.QtCore import QRect
+        from PyQt5.QtGui import QFontMetrics
+        from PyQt5.QtWidgets import QStyleOptionViewItem
+
+        epg_text = index.data(ROLE_EPG_TEXT) or ""
+        starrable = bool(index.data(ROLE_STARRABLE))
+
+        star_w = (self.STAR_BOX + 4) if starrable else 0
+        # EPG column width: up to ~45% of row, capped 360px, min 0 if not enough room
+        epg_col_w = 0
+        if epg_text:
+            avail = option.rect.width() - star_w - self.EPG_GAP - 16
+            epg_col_w = min(360, max(0, int(avail * 0.45)))
+
+        # Render the base item with a narrowed rect so the channel name elides
+        opt = QStyleOptionViewItem(option)
+        opt.rect = QRect(
+            option.rect.x(),
+            option.rect.y(),
+            max(0, option.rect.width() - star_w - epg_col_w - (self.EPG_GAP if epg_col_w else 0)),
+            option.rect.height(),
+        )
+        super().paint(painter, opt, index)
+
+        # Paint EPG text right-aligned in its reserved column
+        if epg_col_w > 0:
+            epg_rect = QRect(
+                option.rect.right() - star_w - epg_col_w - 4,
+                option.rect.y(),
+                epg_col_w,
+                option.rect.height(),
+            )
+            fm = QFontMetrics(option.font)
+            elided = fm.elidedText(epg_text, Qt.ElideRight, epg_col_w)
+            painter.save()
+            painter.setPen(QColor("#7aa3c4"))   # muted blue-grey, readable on light/dark
+            painter.drawText(epg_rect, Qt.AlignRight | Qt.AlignVCenter, elided)
+            painter.restore()
+
+        # Paint the star (or skip if row isn't starrable)
+        if not starrable:
+            return
+        entry = index.data(Qt.UserRole)
+        url = (entry or {}).get("url") if isinstance(entry, dict) else None
+        is_fav = bool(url) and self._app.is_favorited(url)
+
+        painter.save()
+        if is_fav:
+            painter.setPen(QColor("#f5b301"))
+            glyph = self.STAR_SOLID
+        else:
+            painter.setPen(QColor("#888888"))
+            glyph = self.STAR_HOLLOW
+        font = QFont(option.font)
+        font.setPointSize(max(font.pointSize(), 12))
+        painter.setFont(font)
+        painter.drawText(self._star_rect(option), Qt.AlignCenter, glyph)
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() == QtCore.QEvent.MouseButtonRelease:
+            if event.button() == Qt.LeftButton and index.data(ROLE_STARRABLE):
+                if self._star_rect(option).contains(event.pos()):
+                    entry = index.data(Qt.UserRole)
+                    if isinstance(entry, dict) and entry.get("url"):
+                        self._app.toggle_favorite(entry, self._source_tab)
+                    return True
+        return super().editorEvent(event, model, option, index)
+
+
+class FavoritesTreeWidget(QTreeWidget):
+    """QTreeWidget subclass with cycle/leaf-drop validation."""
+
+    def __init__(self, panel, parent=None):
+        super().__init__(parent)
+        self._panel = panel
+
+    def dropEvent(self, event):
+        target = self.itemAt(event.pos())
+        indicator = self.dropIndicatorPosition()
+        dragged = self.currentItem()
+        if dragged is None:
+            event.ignore()
+            return
+
+        dragged_id = dragged.data(0, ROLE_NODE_ID)
+        dragged_kind = dragged.data(0, ROLE_NODE_KIND)
+
+        # Reject dropping ON an entry (entries are leaves)
+        if (target is not None
+                and target.data(0, ROLE_NODE_KIND) == "entry"
+                and indicator == QAbstractItemView.OnItem):
+            event.ignore()
+            return
+
+        # Cycle prevention: cannot drop a group onto itself or a descendant
+        if dragged_kind == "group" and target is not None:
+            target_id = target.data(0, ROLE_NODE_ID)
+            if self._panel._is_descendant(dragged_id, target_id):
+                event.ignore()
+                return
+            if dragged_id == target_id:
+                event.ignore()
+                return
+
+        # Compute new parent + index based on drop position
+        if target is None:
+            # Drop in empty space -> append to root
+            new_parent_id = self._panel._app._favorites_tree["root"]["id"]
+            new_index = len(self._panel._app._favorites_tree["root"]["children"])
+        elif indicator == QAbstractItemView.OnItem:
+            # Drop into the group
+            new_parent_id = target.data(0, ROLE_NODE_ID)
+            target_node = _find_node(self._panel._app._favorites_tree["root"], new_parent_id)
+            new_index = len(target_node[1]["children"]) if target_node else 0
+        else:
+            # Above or below -> sibling of target
+            target_id = target.data(0, ROLE_NODE_ID)
+            found = _find_node(self._panel._app._favorites_tree["root"], target_id)
+            if found is None or found[0] is None:
+                event.ignore()
+                return
+            parent_node, _node, idx = found
+            new_parent_id = parent_node["id"]
+            new_index = idx if indicator == QAbstractItemView.AboveItem else idx + 1
+
+        # Adjust index if moving within the same parent above its old position
+        old = _find_node(self._panel._app._favorites_tree["root"], dragged_id)
+        if old is not None and old[0] is not None and old[0]["id"] == new_parent_id and old[2] < new_index:
+            new_index -= 1
+
+        event.accept()
+        self._panel._app.move_node(dragged_id, new_parent_id, new_index)
+
+
+class FavoritesPanel(QWidget):
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self._app = app
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        toolbar = QHBoxLayout()
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Search favorites (Enter for instant)...")
+        self.search_bar.setClearButtonEnabled(True)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(lambda: self._on_search(self.search_bar.text()))
+        self.search_bar.textChanged.connect(lambda _t: self._search_timer.start())
+        self.search_bar.returnPressed.connect(
+            lambda: (self._search_timer.stop(), self._on_search(self.search_bar.text()))
+        )
+
+        self.new_group_button = QPushButton("New Group")
+        self.new_group_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
+        self.new_group_button.clicked.connect(self._on_new_group_button)
+
+        toolbar.addWidget(self.search_bar)
+        toolbar.addWidget(self.new_group_button)
+        layout.addLayout(toolbar)
+
+        self.tree = FavoritesTreeWidget(self)
+        self.tree.setHeaderHidden(True)
+        self.tree.setDragEnabled(True)
+        self.tree.setAcceptDrops(True)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setDragDropMode(QAbstractItemView.InternalMove)
+        self.tree.setDefaultDropAction(Qt.MoveAction)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_context_menu)
+        self.tree.itemDoubleClicked.connect(self._on_double_click)
+        layout.addWidget(self.tree)
+
+    # -- helpers -------------------------------------------------------
+
+    def _is_descendant(self, ancestor_id, candidate_id):
+        """True if candidate_id is ancestor_id or any of its descendants."""
+        found = _find_node(self._app._favorites_tree["root"], ancestor_id)
+        if found is None:
+            return False
+        ancestor = found[1]
+        hit = {"v": False}
+
+        def visit(n):
+            if n.get("id") == candidate_id:
+                hit["v"] = True
+
+        _walk_tree(ancestor, visit)
+        return hit["v"]
+
+    # -- rendering -----------------------------------------------------
+
+    def _epg_snippet_for(self, entry):
+        """Look up the on-air programme for a LIVE entry; '' if no EPG match."""
+        if not (self._app.epg_data and entry):
+            return ""
+        epg_id = (entry.get("epg_channel_id") or "").strip().lower()
+        if not epg_id:
+            ch_norm = normalize_channel_name(entry.get("name", ""))
+            epg_id = self._app.epg_name_map.get(ch_norm, "")
+        epg_list = self._app.epg_data.get(epg_id, [])
+        if not epg_list:
+            return ""
+        try:
+            now = datetime.now(tz=tz.tzlocal())
+            for prog in epg_list:
+                start = parser.parse(prog["start_time"])
+                stop = parser.parse(prog["stop_time"])
+                if start <= now <= stop:
+                    start_s = start.astimezone(tz.tzlocal()).strftime("%I:%M %p")
+                    stop_s = stop.astimezone(tz.tzlocal()).strftime("%I:%M %p")
+                    return f"{prog['title']} ({start_s}-{stop_s})"
+        except Exception:
+            return ""
+        return ""
+
+    def refresh(self):
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        root = self._app._favorites_tree["root"]
+        self._populate(self.tree.invisibleRootItem(), root["children"])
+        self.tree.expandAll()
+        self.tree.blockSignals(False)
+        self._on_search(self.search_bar.text())
+
+    def _populate(self, parent_item, nodes):
+        for node in nodes:
+            it = QTreeWidgetItem(parent_item)
+            it.setData(0, ROLE_NODE_ID, node["id"])
+            it.setData(0, ROLE_NODE_KIND, node["type"])
+            if node["type"] == "group":
+                it.setText(0, node["name"])
+                it.setIcon(0, self.style().standardIcon(QStyle.SP_DirIcon))
+                it.setFlags(it.flags() | Qt.ItemIsDropEnabled | Qt.ItemIsDragEnabled)
+                self._populate(it, node.get("children", []))
+            else:
+                entry = node.get("entry", {})
+                name = entry.get("name", "Unnamed")
+                src = node.get("source_tab", "")
+                # Stale check: only flag for xtream profiles where we know the host
+                stale = False
+                try:
+                    if (self._app.login_type == 'xtream'
+                            and self._app.server
+                            and entry.get("url")):
+                        e_host = urlparse(entry["url"]).netloc
+                        s_host = urlparse(self._app.server).netloc
+                        if e_host and s_host and e_host != s_host:
+                            stale = True
+                except Exception:
+                    pass
+                label = name if not stale else f"{name} (stale)"
+                if src:
+                    label = f"[{src}] {label}"
+                if src == "LIVE":
+                    epg_snippet = self._epg_snippet_for(entry)
+                    if epg_snippet:
+                        label = f"{label}  —  {epg_snippet}"
+                it.setText(0, label)
+                if src == "LIVE":
+                    it.setIcon(0, self._app.live_channel_icon)
+                elif src == "Movies":
+                    it.setIcon(0, self._app.movies_channel_icon)
+                elif src == "Series":
+                    it.setIcon(0, self._app.series_channel_icon)
+                if stale:
+                    it.setForeground(0, QBrush(QColor("#888888")))
+                it.setFlags((it.flags() | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled)
+
+    # -- search --------------------------------------------------------
+
+    def _on_search(self, text):
+        text = (text or "").strip().lower()
+
+        def visit(item):
+            kind = item.data(0, ROLE_NODE_KIND)
+            if kind == "entry":
+                if not text or text in item.text(0).lower():
+                    item.setHidden(False)
+                    return True
+                item.setHidden(True)
+                return False
+            # group
+            any_visible = False
+            for i in range(item.childCount()):
+                if visit(item.child(i)):
+                    any_visible = True
+            # Always show empty groups; show non-empty groups if any descendant visible OR no search
+            item.setHidden(False if (not text or any_visible or item.childCount() == 0) else True)
+            return any_visible or not text
+
+        for i in range(self.tree.topLevelItemCount()):
+            visit(self.tree.topLevelItem(i))
+
+    # -- interaction ---------------------------------------------------
+
+    def _on_double_click(self, item, column):
+        if item.data(0, ROLE_NODE_KIND) != "entry":
+            return
+        node_id = item.data(0, ROLE_NODE_ID)
+        found = _find_node(self._app._favorites_tree["root"], node_id)
+        if found is None:
+            return
+        node = found[1]
+        entry = node.get("entry", {})
+        if entry.get("url"):
+            self._app.play_channel(entry)
+
+    def _on_new_group_button(self):
+        # If a group is selected, create as a subgroup; otherwise under root.
+        selected = self.tree.currentItem()
+        parent_id = self._app._favorites_tree["root"]["id"]
+        if selected is not None and selected.data(0, ROLE_NODE_KIND) == "group":
+            parent_id = selected.data(0, ROLE_NODE_ID)
+        name, ok = QInputDialog.getText(self, "New Group", "Group name:")
+        if ok and name.strip():
+            self._app.add_group(parent_id, name.strip())
+
+    def _on_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        menu = QMenu(self.tree)
+        if item is None:
+            act_new = menu.addAction("New Group")
+            chosen = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+            if chosen == act_new:
+                root_id = self._app._favorites_tree["root"]["id"]
+                name, ok = QInputDialog.getText(self, "New Group", "Group name:")
+                if ok and name.strip():
+                    self._app.add_group(root_id, name.strip())
+            return
+
+        kind = item.data(0, ROLE_NODE_KIND)
+        node_id = item.data(0, ROLE_NODE_ID)
+
+        if kind == "group":
+            act_sub = menu.addAction("New Subgroup")
+            act_rename = menu.addAction("Rename")
+            act_delete = menu.addAction("Delete Group")
+            chosen = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+            if chosen == act_sub:
+                name, ok = QInputDialog.getText(self, "New Subgroup", "Subgroup name:")
+                if ok and name.strip():
+                    self._app.add_group(node_id, name.strip())
+            elif chosen == act_rename:
+                found = _find_node(self._app._favorites_tree["root"], node_id)
+                current = found[1]["name"] if found else ""
+                name, ok = QInputDialog.getText(self, "Rename Group", "New name:", text=current)
+                if ok and name.strip():
+                    self._app.rename_node(node_id, name.strip())
+            elif chosen == act_delete:
+                resp = QMessageBox.question(
+                    self, "Delete Group",
+                    "Delete this group and all its contents? Favorited items inside will be unstarred.",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if resp == QMessageBox.Yes:
+                    self._app.delete_node(node_id)
+        else:  # entry
+            act_play = menu.addAction("Play")
+            act_remove = menu.addAction("Remove from Favorites")
+            chosen = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+            if chosen == act_play:
+                self._on_double_click(item, 0)
+            elif chosen == act_remove:
+                self._app.remove_favorite(node_id)
+
+
+class ProfilesDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Address Book")
+        self.setWindowTitle("Profiles")
         self.setMinimumSize(400, 300)
         self.parent = parent
 
@@ -193,6 +818,9 @@ class AddressBookDialog(QtWidgets.QDialog):
                 elif method == 'm3u_plus':
                     m3u_url, = credentials
                     config['Credentials'][name] = f"m3u_plus|{m3u_url}"
+                elif method == 'local_m3u':
+                    file_path, = credentials
+                    config['Credentials'][name] = f"local_m3u|{file_path}"
                 with open('credentials.ini', 'w') as config_file:
                     config.write(config_file)
                 self.load_saved_credentials()
@@ -201,20 +829,7 @@ class AddressBookDialog(QtWidgets.QDialog):
         selected_item = self.credentials_list.currentItem()
         if selected_item:
             name = selected_item.text()
-            config = configparser.ConfigParser()
-            config.read('credentials.ini')
-            if 'Credentials' in config and name in config['Credentials']:
-                data = config['Credentials'][name]
-                if data.startswith('manual|'):
-                    _, server, username, password = data.split('|')
-                    self.parent.server_entry.setText(server)
-                    self.parent.username_entry.setText(username)
-                    self.parent.password_entry.setText(password)
-                    self.parent.login()
-                elif data.startswith('m3u_plus|'):
-                    _, m3u_url = data.split('|', 1)
-                    self.parent.extract_credentials_from_m3u_plus_url(m3u_url)
-                    self.parent.login()
+            if self.parent.load_profile_by_name(name):
                 self.accept()
 
     def double_click_credentials(self, item):
@@ -240,7 +855,7 @@ class AddCredentialsDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
 
         self.method_selector = QtWidgets.QComboBox()
-        self.method_selector.addItems(["Manual Entry", "m3u_plus URL Entry"])
+        self.method_selector.addItems(["Manual Entry", "m3u_plus URL Entry", "Local M3U File"])
         layout.addWidget(QtWidgets.QLabel("Select Method:"))
         layout.addWidget(self.method_selector)
 
@@ -266,8 +881,25 @@ class AddCredentialsDialog(QtWidgets.QDialog):
         m3u_layout.addRow("Name:", self.name_entry_m3u)
         m3u_layout.addRow("m3u_plus URL:", self.m3u_url_entry)
 
+        self.local_form = QtWidgets.QWidget()
+        local_layout = QFormLayout(self.local_form)
+        self.name_entry_local = QLineEdit()
+        path_row = QHBoxLayout()
+        self.local_path_entry = QLineEdit()
+        self.local_path_entry.setReadOnly(True)
+        self.local_path_entry.setPlaceholderText("Choose an .m3u / .m3u8 file...")
+        self.local_browse_button = QPushButton("Browse...")
+        self.local_browse_button.clicked.connect(self._pick_local_m3u_file)
+        path_row.addWidget(self.local_path_entry)
+        path_row.addWidget(self.local_browse_button)
+        path_row_widget = QWidget()
+        path_row_widget.setLayout(path_row)
+        local_layout.addRow("Name:", self.name_entry_local)
+        local_layout.addRow("M3U File:", path_row_widget)
+
         self.stack.addWidget(self.manual_form)
         self.stack.addWidget(self.m3u_form)
+        self.stack.addWidget(self.local_form)
 
         self.method_selector.currentIndexChanged.connect(self.stack.setCurrentIndex)
 
@@ -277,6 +909,16 @@ class AddCredentialsDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
         buttons.accepted.connect(self.validate_and_accept)
         buttons.rejected.connect(self.reject)
+
+    def _pick_local_m3u_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select M3U Playlist",
+            QDir.homePath(),
+            "M3U Playlists (*.m3u *.m3u8 *.m3u_plus);;All Files (*)"
+        )
+        if path:
+            self.local_path_entry.setText(path)
 
     def validate_and_accept(self):
         method = self.method_selector.currentText()
@@ -289,11 +931,21 @@ class AddCredentialsDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "Input Error", "Please fill all fields for Manual Entry.")
                 return
             self.accept()
-        else:
+        elif method == "m3u_plus URL Entry":
             name = self.name_entry_m3u.text().strip()
             m3u_url = self.m3u_url_entry.text().strip()
             if not name or not m3u_url:
                 QtWidgets.QMessageBox.warning(self, "Input Error", "Please fill all fields for m3u_plus URL Entry.")
+                return
+            self.accept()
+        else:  # Local M3U File
+            name = self.name_entry_local.text().strip()
+            file_path = self.local_path_entry.text().strip()
+            if not name or not file_path:
+                QtWidgets.QMessageBox.warning(self, "Input Error", "Please provide a name and choose a file.")
+                return
+            if not os.path.isfile(file_path):
+                QtWidgets.QMessageBox.warning(self, "Input Error", "The selected file does not exist or is not readable.")
                 return
             self.accept()
 
@@ -305,10 +957,14 @@ class AddCredentialsDialog(QtWidgets.QDialog):
             username = self.username_entry.text().strip()
             password = self.password_entry.text().strip()
             return ('manual', name, server, username, password)
-        else:
+        elif method == "m3u_plus URL Entry":
             name = self.name_entry_m3u.text().strip()
             m3u_url = self.m3u_url_entry.text().strip()
             return ('m3u_plus', name, m3u_url)
+        else:
+            name = self.name_entry_local.text().strip()
+            file_path = self.local_path_entry.text().strip()
+            return ('local_m3u', name, file_path)
 
 class IPTVPlayerApp(QMainWindow):
     def __init__(self):
@@ -339,7 +995,9 @@ class IPTVPlayerApp(QMainWindow):
         self.server = ""
         self.username = ""
         self.password = ""
-        self.login_type = None  
+        self.login_type = None
+        self._local_entries_by_category = {}
+        self._local_source_path = None
         self.epg_data = {}  
         self.channel_id_to_names = {}  
         self.epg_last_updated = None  
@@ -406,10 +1064,10 @@ class IPTVPlayerApp(QMainWindow):
         self.m3u_plus_button.setIcon(search_icon)
         self.m3u_plus_button.clicked.connect(self.open_m3u_plus_dialog)
 
-        self.address_book_button = QPushButton("Address Book")
-        self.address_book_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
-        self.address_book_button.setToolTip("Manage Saved Credentials")
-        self.address_book_button.clicked.connect(self.open_address_book)
+        self.profiles_button = QPushButton("Profiles")
+        self.profiles_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        self.profiles_button.setToolTip("Manage Saved Profiles")
+        self.profiles_button.clicked.connect(self.open_profiles)
 
         self.choose_player_button = QPushButton("Choose Media Player")
         self.choose_player_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
@@ -417,7 +1075,7 @@ class IPTVPlayerApp(QMainWindow):
 
         buttons_layout.addWidget(self.login_button)
         buttons_layout.addWidget(self.m3u_plus_button)
-        buttons_layout.addWidget(self.address_book_button)
+        buttons_layout.addWidget(self.profiles_button)
         buttons_layout.addWidget(self.choose_player_button)
 
         checkbox_layout = QHBoxLayout()
@@ -434,9 +1092,17 @@ class IPTVPlayerApp(QMainWindow):
         checkbox_layout.addWidget(self.keep_on_top_checkbox)
 
         self.epg_checkbox = QCheckBox("Download EPG")
-        self.epg_checkbox.setToolTip("Check to download EPG data for channels")
+        self.epg_checkbox.setToolTip(
+            "Download EPG data for channels. Preference is remembered across launches; "
+            "data refreshes automatically every 60 minutes."
+        )
         self.epg_checkbox.stateChanged.connect(self.on_epg_checkbox_toggled)
         checkbox_layout.addWidget(self.epg_checkbox)
+
+        # Periodic EPG background refresh. Started/stopped by the checkbox handler.
+        self._epg_refresh_timer = QTimer(self)
+        self._epg_refresh_timer.setInterval(EPG_REFRESH_INTERVAL_MS)
+        self._epg_refresh_timer.timeout.connect(self._on_epg_refresh_tick)
 
         # **Add Dark Theme Checkbox**
         self.dark_theme_checkbox = QCheckBox("Dark Theme")
@@ -487,22 +1153,31 @@ class IPTVPlayerApp(QMainWindow):
         self.series_layout = QVBoxLayout(self.series_tab)
 
         self.search_bar_live = QLineEdit()
-        self.search_bar_live.setPlaceholderText("Search Live Channels...")
+        self.search_bar_live.setPlaceholderText("Search Live Channels (Enter for instant)...")
         self.search_bar_live.setClearButtonEnabled(True)
         self.add_search_icon(self.search_bar_live)
-        self.search_bar_live.textChanged.connect(lambda text: self.search_in_list('LIVE', text))
+        self._install_debounced_search(
+            self.search_bar_live,
+            lambda text: self.search_in_list('LIVE', text),
+        )
 
         self.search_bar_movies = QLineEdit()
-        self.search_bar_movies.setPlaceholderText("Search Movies...")
+        self.search_bar_movies.setPlaceholderText("Search Movies (Enter for instant)...")
         self.search_bar_movies.setClearButtonEnabled(True)
         self.add_search_icon(self.search_bar_movies)
-        self.search_bar_movies.textChanged.connect(lambda text: self.search_in_list('Movies', text))
+        self._install_debounced_search(
+            self.search_bar_movies,
+            lambda text: self.search_in_list('Movies', text),
+        )
 
         self.search_bar_series = QLineEdit()
-        self.search_bar_series.setPlaceholderText("Search Series...")
+        self.search_bar_series.setPlaceholderText("Search Series (Enter for instant)...")
         self.search_bar_series.setClearButtonEnabled(True)
         self.add_search_icon(self.search_bar_series)
-        self.search_bar_series.textChanged.connect(lambda text: self.search_in_list('Series', text))
+        self._install_debounced_search(
+            self.search_bar_series,
+            lambda text: self.search_in_list('Series', text),
+        )
 
         self.add_search_bar(self.live_layout, self.search_bar_live)
         self.add_search_bar(self.movies_layout, self.search_bar_movies)
@@ -545,6 +1220,28 @@ class IPTVPlayerApp(QMainWindow):
         self.channel_list_movies.itemDoubleClicked.connect(self.channel_item_double_clicked)
         self.channel_list_series.itemDoubleClicked.connect(self.channel_item_double_clicked)
 
+        # Favorites state and per-list star delegates
+        self._active_profile_name = None
+        self._favorites_tree = _empty_favorites_tree()
+        self._fav_url_index = {}
+        os.makedirs(FAVORITES_DIR, exist_ok=True)
+
+        # One-shot cache of all leaf entries per tab, used by deep top-level search.
+        self._all_entries_cache = {'LIVE': None, 'Movies': None, 'Series': None}
+
+        self._star_delegate_live = FavoritesStarDelegate(self, "LIVE", self.channel_list_live)
+        self._star_delegate_movies = FavoritesStarDelegate(self, "Movies", self.channel_list_movies)
+        self._star_delegate_series = FavoritesStarDelegate(self, "Series", self.channel_list_series)
+        self.channel_list_live.setItemDelegate(self._star_delegate_live)
+        self.channel_list_movies.setItemDelegate(self._star_delegate_movies)
+        self.channel_list_series.setItemDelegate(self._star_delegate_series)
+
+        # Favorites tab (leftmost)
+        self.favorites_tab = FavoritesPanel(self)
+        fav_icon = self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
+        self.tab_widget.insertTab(0, self.favorites_tab, fav_icon, "Favorites")
+        self.tab_widget.setCurrentIndex(0)
+
         self.info_tab = QWidget()
         self.info_tab_layout = QVBoxLayout(self.info_tab)
         self.result_display = QTextEdit(self.info_tab)
@@ -571,8 +1268,17 @@ class IPTVPlayerApp(QMainWindow):
         self.playlist_progress_animation.setEasingCurve(QEasingCurve.InOutQuad)
 
         self.load_theme_preference()
+        # Restore EPG-enabled preference. Setting the checkbox here triggers
+        # on_epg_checkbox_toggled, which is a no-op until a profile loads
+        # (server/username are still empty). Once autoload_last_profile fires
+        # below and the profile loads via load_profile_by_name -> login ->
+        # fetch_categories_only, that flow already kicks off EPG loading
+        # because epg_checkbox.isChecked() is True.
+        if self.load_epg_enabled():
+            self.epg_checkbox.setChecked(True)
+        self.autoload_last_profile()
 
-    
+
 
     def toggle_dark_theme(self, state):
         """
@@ -646,6 +1352,32 @@ class IPTVPlayerApp(QMainWindow):
         with open('config.ini', 'w') as config_file:
             config.write(config_file)
 
+    def _install_debounced_search(self, line_edit, callback, delay_ms=300):
+        """
+        Wires a QLineEdit so that the search callback runs once after the user
+        pauses typing for `delay_ms` milliseconds, and immediately on Enter.
+        """
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(delay_ms)
+        pending = {"text": ""}
+
+        def fire():
+            callback(pending["text"])
+
+        def on_text_changed(text):
+            pending["text"] = text
+            timer.start()
+
+        def on_return_pressed():
+            timer.stop()
+            callback(line_edit.text())
+
+        timer.timeout.connect(fire)
+        line_edit.textChanged.connect(on_text_changed)
+        line_edit.returnPressed.connect(on_return_pressed)
+        return timer
+
     def add_search_icon(self, search_bar):
         search_icon = QIcon.fromTheme("edit-find")
         if search_icon.isNull():
@@ -679,8 +1411,8 @@ class IPTVPlayerApp(QMainWindow):
         text, ok = QtWidgets.QInputDialog.getText(self, 'M3u_plus Login', 'Enter m3u_plus URL:')
         if ok and text:
             m3u_plus_url = text.strip()
-            self.extract_credentials_from_m3u_plus_url(m3u_plus_url)
-            self.login()
+            if self.extract_credentials_from_m3u_plus_url(m3u_plus_url):
+                self.login()
 
     def update_font_size(self, value):
         self.default_font_size = value
@@ -697,20 +1429,28 @@ class IPTVPlayerApp(QMainWindow):
 
     def extract_credentials_from_m3u_plus_url(self, url):
         try:
-            pattern = r'(http[s]?://[^/]+)/get\.php\?username=([^&]*)&password=([^&]*)&type=(m3u_plus|m3u|&output=m3u8)'
-            match = re.match(pattern, url)
-            if match:
-                self.server = match.group(1)
-                self.username = match.group(2)
-                self.password = match.group(3)
-                self.server_entry.setText(self.server)
-                self.username_entry.setText(self.username)
-                self.password_entry.setText(self.password)
-            else:
-                self.animate_progress(0, 100, "Invalid m3u_plus or m3u URL")
+            parsed = urlparse((url or "").strip())
+            if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+                self.animate_progress(0, 100, "Invalid m3u_plus URL")
+                return False
+            qs = parse_qs(parsed.query)
+            username = (qs.get('username') or [''])[0].strip()
+            password = (qs.get('password') or [''])[0].strip()
+            if not username or not password:
+                self.animate_progress(0, 100, "URL missing username or password")
+                return False
+            server = f"{parsed.scheme}://{parsed.netloc}"
+            self.server = server
+            self.username = username
+            self.password = password
+            self.server_entry.setText(server)
+            self.username_entry.setText(username)
+            self.password_entry.setText(password)
+            return True
         except Exception as e:
             print(f"Error extracting credentials: {e}")
             self.animate_progress(0, 100, "Error extracting credentials")
+            return False
 
     def set_progress_text(self, text):
         self.progress_bar.setFormat(text)
@@ -736,14 +1476,10 @@ class IPTVPlayerApp(QMainWindow):
         for tab_name, list_widget in self.list_widgets.items():
             list_widget.clear()
 
-        cache_file = 'epg_cache1.xml'
-        if os.path.exists(cache_file):
-            try:
-                os.remove(cache_file)
-            except Exception as e:
-                print(f"Error deleting EPG cache: {e}")
-                self.animate_progress(0, 100, "Error deleting EPG cache")
-                return
+        # NB: we no longer delete the on-disk EPG cache here. The cache is
+        # per-server (keyed by server URL) and managed by EPGWorker, which
+        # honors EPG_CACHE_TTL_SECONDS. Forcing a delete here would defeat
+        # the cache for legitimate same-server reloads.
 
         server = self.server_entry.text().strip()
         username = self.username_entry.text().strip()
@@ -789,6 +1525,7 @@ class IPTVPlayerApp(QMainWindow):
             self.username = username
             self.password = password
             self.login_type = 'xtream'
+            self._all_entries_cache = {'LIVE': None, 'Movies': None, 'Series': None}
             self.navigation_stacks = {'LIVE': [], 'Movies': [], 'Series': []}
             self.top_level_scroll_positions = {'LIVE': 0, 'Movies': 0, 'Series': 0}
             self.update_category_lists('LIVE')
@@ -818,6 +1555,77 @@ class IPTVPlayerApp(QMainWindow):
         except Exception as e:
             print(f"Error fetching categories: {e}")
             self.animate_progress(self.progress_bar.value(), 100, "Error fetching categories")
+
+    def load_local_m3u(self, file_path):
+        try:
+            self.reset_progress_bar()
+            self.epg_data = {}
+            self.channel_id_to_names = {}
+            self.epg_last_updated = None
+            for lw in self.list_widgets.values():
+                lw.clear()
+
+            if not file_path or not os.path.isfile(file_path):
+                self.animate_progress(0, 100, "M3U file not found")
+                return
+
+            self.animate_progress(0, 50, "Parsing M3U...")
+            try:
+                parsed = load_or_parse_m3u_with_cache(file_path)
+            except Exception as e:
+                print(f"Error parsing M3U: {e}")
+                self.animate_progress(0, 100, "Error parsing M3U")
+                return
+
+            self.groups = parsed['groups']
+            entries_by_cat = {}
+            for key, value in parsed['entries_by_category'].items():
+                tab, _, group_title = key.partition('||')
+                entries_by_cat[(tab, group_title)] = value
+            self._local_entries_by_category = entries_by_cat
+            self._local_source_path = parsed.get('source_path', file_path)
+
+            self.server = ""
+            self.username = ""
+            self.password = ""
+            self.login_type = 'local_m3u'
+            self._all_entries_cache = {'LIVE': None, 'Movies': None, 'Series': None}
+            self.navigation_stacks = {'LIVE': [], 'Movies': [], 'Series': []}
+            self.top_level_scroll_positions = {'LIVE': 0, 'Movies': 0, 'Series': 0}
+            self.entries_per_tab = {'LIVE': [], 'Movies': [], 'Series': []}
+
+            for tab in ('LIVE', 'Movies', 'Series'):
+                self.update_category_lists(tab)
+
+            total = sum(len(v) for v in entries_by_cat.values())
+            self.result_display.setText(
+                f"Local playlist loaded\n"
+                f"File: {self._local_source_path}\n"
+                f"Total entries: {total}\n"
+                f"LIVE categories: {len(self.groups['LIVE'])}\n"
+                f"Movie categories: {len(self.groups['Movies'])}\n"
+                f"Series categories: {len(self.groups['Series'])}\n"
+            )
+            self.info_tab_initialized = True
+
+            if total == 0:
+                self.animate_progress(self.progress_bar.value(), 100, "Empty or invalid M3U")
+            else:
+                self.animate_progress(self.progress_bar.value(), 100, "Playlist loaded")
+        except Exception as e:
+            print(f"Error loading local M3U: {e}")
+            self.animate_progress(0, 100, "Error loading local M3U")
+
+    def _show_local_category_entries(self, category_name, tab_name):
+        entries = self._local_entries_by_category.get((tab_name, category_name), [])
+        self.entries_per_tab[tab_name] = entries
+        list_widget = self.get_list_widget(tab_name)
+        self.navigation_stacks[tab_name].append({
+            'level': 'channels',
+            'data': {'tab_name': tab_name, 'entries': entries},
+            'scroll_position': 0,
+        })
+        self.show_channels(list_widget, tab_name)
 
     def fetch_additional_data(self, server, username, password):
         try:
@@ -882,10 +1690,18 @@ class IPTVPlayerApp(QMainWindow):
             # Can't load EPG if not logged in
             return
         http_method = self.get_http_method()
-        epg_worker = EPGWorker(self.server, self.username, self.password, http_method)
+        epg_worker = EPGWorker(
+            self.server, self.username, self.password, http_method,
+            _epg_cache_file_for(self.server),
+        )
         epg_worker.signals.finished.connect(self.on_epg_loaded)
         epg_worker.signals.error.connect(self.on_epg_error)
         self.threadpool.start(epg_worker)
+        # Ensure the periodic refresh keeps running while EPG is enabled.
+        if (self.epg_checkbox.isChecked()
+                and hasattr(self, '_epg_refresh_timer')
+                and not self._epg_refresh_timer.isActive()):
+            self._epg_refresh_timer.start()
 
     def on_epg_loaded(self, epg_data, channel_id_to_names):
         self.epg_data = epg_data
@@ -900,6 +1716,16 @@ class IPTVPlayerApp(QMainWindow):
 
         # EPG done
         self.animate_progress(self.progress_bar.value(), 100, "EPG data loaded")
+
+        # If LIVE is currently showing a channel list, rebuild it so each row
+        # picks up its on-air EPG snippet (stored on the item at render time).
+        live_stack = self.navigation_stacks.get('LIVE', [])
+        if live_stack and live_stack[-1].get('level') == 'channels':
+            self.show_channels(self.channel_list_live, 'LIVE')
+
+        # Favorites tree needs a rebuild so LIVE entries pick up EPG snippets.
+        if hasattr(self, 'favorites_tab'):
+            self.favorites_tab.refresh()
 
     def on_epg_error(self, error_message):
         print(f"Error fetching EPG data: {error_message}")
@@ -981,6 +1807,73 @@ class IPTVPlayerApp(QMainWindow):
             self.animate_progress(self.progress_bar.value(), 100, "Error updating lists")
 
         # ─── inside class IPTVPlayerApp ─────────────────────────────────────────────
+    def _get_all_entries(self, tab_name):
+        """
+        Return a flat list of all leaf entries for `tab_name`, fetching
+        once per session for Xtream profiles (no category_id filter pulls
+        the whole catalog in a single request). For local M3U profiles,
+        aggregates the in-memory groups. For Xtream Series, returns
+        series-title entries (clicking drills into seasons).
+        """
+        cached = self._all_entries_cache.get(tab_name)
+        if cached is not None:
+            return cached
+
+        entries = []
+        if self.login_type == 'local_m3u':
+            for (tab, _grp), items in self._local_entries_by_category.items():
+                if tab == tab_name:
+                    entries.extend(items)
+        elif self.login_type == 'xtream' and self.server and self.username:
+            try:
+                self.animate_progress(0, 60, f"Indexing all {tab_name} for search...")
+                params = {
+                    "username": self.username,
+                    "password": self.password,
+                    "action": "",
+                }
+                if tab_name == "LIVE":
+                    params["action"] = "get_live_streams"
+                    stream_type = "live"
+                elif tab_name == "Movies":
+                    params["action"] = "get_vod_streams"
+                    stream_type = "movie"
+                else:
+                    params["action"] = "get_series"
+                    stream_type = "series"
+                resp = self.make_request(
+                    self.get_http_method(),
+                    f"{self.server}/player_api.php",
+                    params,
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, list):
+                    data = []
+                # Decorate the same way fetch_channels does
+                for entry in data:
+                    sid = entry.get("stream_id")
+                    if sid and tab_name in ("LIVE", "Movies"):
+                        ext = "ts" if tab_name == "LIVE" else entry.get("container_extension", "m3u8")
+                        entry["url"] = (
+                            f"{self.server}/{stream_type}/{self.username}/"
+                            f"{self.password}/{sid}.{ext}"
+                        )
+                    epg_id = (entry.get("epg_channel_id") or "").strip().lower()
+                    entry["epg_channel_id"] = epg_id if epg_id else None
+                entries = data
+                self.animate_progress(self.progress_bar.value(), 100,
+                                      f"Indexed {len(entries)} {tab_name} entries")
+            except Exception as e:
+                print(f"Error indexing {tab_name}: {e}")
+                self.animate_progress(self.progress_bar.value(), 100,
+                                      f"Error indexing {tab_name}")
+                entries = []
+
+        self._all_entries_cache[tab_name] = entries
+        return entries
+
     def fetch_channels(self, category_name, tab_name):
         """
         Retrieve the LIVE / VOD / Series list for the chosen category and show
@@ -1093,7 +1986,10 @@ class IPTVPlayerApp(QMainWindow):
 
             if tab_name != "Series":
                 if selected_text in [group["category_name"] for group in self.groups[tab_name]]:
-                    self.fetch_channels(selected_text, tab_name)
+                    if self.login_type == 'local_m3u':
+                        self._show_local_category_entries(selected_text, tab_name)
+                    else:
+                        self.fetch_channels(selected_text, tab_name)
                 else:
                     selected_entry = selected_item.data(Qt.UserRole)
                     if selected_entry and "url" in selected_entry:
@@ -1103,9 +1999,23 @@ class IPTVPlayerApp(QMainWindow):
             # Series logic
             if tab_name == "Series":
                 if not stack:
-                    if selected_text in [group["category_name"] for group in self.groups["Series"]]:
-                        self.fetch_series_in_category(selected_text)
+                    # If the row is a series entry (e.g. from a deep search result),
+                    # drill into its seasons directly.
+                    selected_entry = selected_item.data(Qt.UserRole)
+                    if isinstance(selected_entry, dict) and selected_entry.get("series_id"):
+                        self.fetch_seasons(selected_entry)
                         return
+                    if selected_text in [group["category_name"] for group in self.groups["Series"]]:
+                        if self.login_type == 'local_m3u':
+                            self._show_local_category_entries(selected_text, "Series")
+                        else:
+                            self.fetch_series_in_category(selected_text)
+                        return
+                elif stack[-1]['level'] == 'channels':
+                    selected_entry = selected_item.data(Qt.UserRole)
+                    if selected_entry and "url" in selected_entry:
+                        self.play_channel(selected_entry)
+                    return
                 elif stack[-1]['level'] == 'series_categories':
                     series_entry = selected_item.data(Qt.UserRole)
                     if series_entry and "series_id" in series_entry:
@@ -1524,8 +2434,9 @@ class IPTVPlayerApp(QMainWindow):
             for entry in self.entries_per_tab[tab_name]:
                 display_text = entry.get("name", "Unnamed")
                 tooltip_text = ""                 # defaults to nothing
+                epg_text = ""                     # rendered in the right column by the delegate
 
-                # ─── LIVE: append on-air title to row text (if EPG ready) ───────
+                # ─── LIVE: capture on-air programme (if EPG ready) ──────────────
                 if tab_name == "LIVE" and self.epg_data:
                     epg_id = entry.get("epg_channel_id") or ""
                     if not epg_id:
@@ -1537,11 +2448,10 @@ class IPTVPlayerApp(QMainWindow):
                         start = parser.parse(prog["start_time"])
                         stop  = parser.parse(prog["stop_time"])
                         if start <= now <= stop:
-                            # add programme title & time window to the row text
                             start_s = start.astimezone(tz.tzlocal()).strftime("%I:%M %p")
                             stop_s  = stop.astimezone(tz.tzlocal()).strftime("%I:%M %p")
-                            display_text += f" – {prog['title']} ({start_s}-{stop_s})"
-                            tooltip_text   = prog["description"]          # may be “”
+                            epg_text = f"{prog['title']} ({start_s}-{stop_s})"
+                            tooltip_text = prog["description"]            # may be ""
                             break
 
                 # ─── Movies / Series placeholder (“Loading preview…”) ───────────
@@ -1551,6 +2461,9 @@ class IPTVPlayerApp(QMainWindow):
                 # build list row --------------------------------------------------
                 itm = QListWidgetItem(display_text)
                 itm.setData(Qt.UserRole, entry)
+                itm.setData(ROLE_STARRABLE, True)
+                if epg_text:
+                    itm.setData(ROLE_EPG_TEXT, epg_text)
                 itm.setIcon(row_icon)
 
                 # LIVE: show nothing until EPG is ready
@@ -1763,6 +2676,7 @@ class IPTVPlayerApp(QMainWindow):
 
                 itm = QListWidgetItem(display_txt)
                 itm.setData(Qt.UserRole, ep_entry)
+                itm.setData(ROLE_STARRABLE, True)
                 itm.setIcon(self.series_channel_icon)
                 items.append(itm)
 
@@ -1824,7 +2738,7 @@ class IPTVPlayerApp(QMainWindow):
                     self.info_tab_initialized = True
                 return
 
-            if self.login_type == 'xtream':
+            if self.login_type in ('xtream', 'local_m3u'):
                 stack = self.navigation_stacks.get(tab_name, [])
                 list_widget = self.get_list_widget(tab_name)
 
@@ -2012,116 +2926,143 @@ class IPTVPlayerApp(QMainWindow):
             return  # Done reverting on empty text
 
         # 2) The user typed something => do the search
-        list_widget.clear()
+        list_widget.setUpdatesEnabled(False)
+        try:
+            list_widget.clear()
 
-        # If inside a sub-level, we add "Go Back" at the top
-        if self.navigation_stacks[tab_name]:
-            go_back_item = QListWidgetItem("Go Back")
-            go_back_item.setIcon(self.go_back_icon)
-            list_widget.addItem(go_back_item)
+            # If inside a sub-level, we add "Go Back" at the top
+            if self.navigation_stacks[tab_name]:
+                go_back_item = QListWidgetItem("Go Back")
+                go_back_item.setIcon(self.go_back_icon)
+                list_widget.addItem(go_back_item)
 
-        filtered_items = []
+            filtered_items = []
+            text_lower = text.lower()
 
-        # 2A) If we are at TOP-LEVEL (stack is empty):
-        #     => Search among category names in self.groups[tab_name]
-        if not self.navigation_stacks[tab_name]:
-            group_list = self.groups.get(tab_name, [])
-            for group in group_list:
-                cat_name = group["category_name"]
-                if text.lower() in cat_name.lower():
-                    # We found a matching category
-                    item = QListWidgetItem(cat_name)
-                    if tab_name == 'LIVE':
-                        item.setIcon(self.live_channel_icon)
-                    elif tab_name == 'Movies':
-                        item.setIcon(self.movies_channel_icon)
-                    elif tab_name == 'Series':
-                        item.setIcon(self.series_channel_icon)
-                    else:
-                        item.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
+            # 2A) If we are at TOP-LEVEL (stack is empty):
+            #     => Search category names AND all leaf entries (deep search).
+            if not self.navigation_stacks[tab_name]:
+                if tab_name == 'LIVE':
+                    cat_icon = self.live_channel_icon
+                elif tab_name == 'Movies':
+                    cat_icon = self.movies_channel_icon
+                elif tab_name == 'Series':
+                    cat_icon = self.series_channel_icon
+                else:
+                    cat_icon = self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon)
 
+                for group in self.groups.get(tab_name, []):
+                    cat_name = group["category_name"]
+                    if text_lower in cat_name.lower():
+                        item = QListWidgetItem(cat_name)
+                        item.setIcon(cat_icon)
+                        filtered_items.append(item)
+
+                # Deep search: also look across every leaf entry
+                # (one-time API fetch for Xtream, free for local M3U)
+                for entry in self._get_all_entries(tab_name):
+                    name = entry.get("name", "")
+                    if not name or text_lower not in name.lower():
+                        continue
+                    item = QListWidgetItem(name)
+                    item.setData(Qt.UserRole, entry)
+                    if tab_name in ('LIVE', 'Movies'):
+                        item.setData(ROLE_STARRABLE, True)
+                    item.setIcon(cat_icon)
                     filtered_items.append(item)
 
-        # 2B) If we are INSIDE a sub-level (stack is not empty):
-        else:
-            # Look at the last level
-            last_level = self.navigation_stacks[tab_name][-1]
-            level = last_level['level']
+            # 2B) If we are INSIDE a sub-level (stack is not empty):
+            else:
+                last_level = self.navigation_stacks[tab_name][-1]
+                level = last_level['level']
 
-            if level == 'channels':
-                # We’re in a channel list => search channels in entries_per_tab[tab_name]
-                for entry in self.entries_per_tab[tab_name]:
-                    channel_name = entry.get('name', '')
-                    if text.lower() in channel_name.lower():
-                        item = QListWidgetItem(channel_name)
-                        item.setData(Qt.UserRole, entry)
-                        if tab_name == 'LIVE':
-                            item.setIcon(self.live_channel_icon)
-                        elif tab_name == 'Movies':
-                            item.setIcon(self.movies_channel_icon)
-                        else:
-                            item.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
-                        filtered_items.append(item)
+                if level == 'channels':
+                    if tab_name == 'LIVE':
+                        row_icon = self.live_channel_icon
+                    elif tab_name == 'Movies':
+                        row_icon = self.movies_channel_icon
+                    else:
+                        row_icon = self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon)
+                    for entry in self.entries_per_tab[tab_name]:
+                        channel_name = entry.get('name', '')
+                        if text_lower in channel_name.lower():
+                            item = QListWidgetItem(channel_name)
+                            item.setData(Qt.UserRole, entry)
+                            item.setData(ROLE_STARRABLE, True)
+                            item.setIcon(row_icon)
+                            filtered_items.append(item)
 
-            elif level == 'series_categories':
-                # We’re in a series-list => search in self.current_series_list
-                for series_info in self.current_series_list:
-                    series_name = series_info["name"]
-                    if text.lower() in series_name.lower():
-                        item = QListWidgetItem(series_name)
-                        item.setData(Qt.UserRole, series_info)
-                        item.setIcon(self.series_channel_icon)
-                        filtered_items.append(item)
+                elif level == 'series_categories':
+                    for series_info in self.current_series_list:
+                        series_name = series_info["name"]
+                        if text_lower in series_name.lower():
+                            item = QListWidgetItem(series_name)
+                            item.setData(Qt.UserRole, series_info)
+                            item.setIcon(self.series_channel_icon)
+                            filtered_items.append(item)
 
-            elif level == 'series':
-                # We’re listing the seasons => let's see if user typed "Season 1", "Season 2", etc.
-                for season in self.current_seasons:
-                    label = f"Season {season}"
-                    if text.lower() in label.lower():
-                        item = QListWidgetItem(label)
-                        item.setData(Qt.UserRole, season)
-                        item.setIcon(self.series_channel_icon)
-                        filtered_items.append(item)
+                elif level == 'series':
+                    for season in self.current_seasons:
+                        label = f"Season {season}"
+                        if text_lower in label.lower():
+                            item = QListWidgetItem(label)
+                            item.setData(Qt.UserRole, season)
+                            item.setIcon(self.series_channel_icon)
+                            filtered_items.append(item)
 
-            elif level == 'season':
-                # We’re listing episodes => search by episode title
-                for episode in self.current_episodes:
-                    ep_title = episode.get('title', '')
-                    if text.lower() in ep_title.lower():
-                        display_text = f"Episode {episode['episode_num']}: {ep_title}"
-                        episode_entry = {
-                            "season": episode.get('season'),
-                            "episode_num": episode['episode_num'],
-                            "name": display_text,
-                            "url": f"{self.server}/series/{self.username}/{self.password}/{episode['id']}.{episode.get('container_extension', 'm3u8')}",
-                            "title": ep_title
-                        }
-                        item = QListWidgetItem(display_text)
-                        item.setData(Qt.UserRole, episode_entry)
-                        item.setIcon(self.series_channel_icon)
-                        filtered_items.append(item)
+                elif level == 'season':
+                    for episode in self.current_episodes:
+                        ep_title = episode.get('title', '')
+                        if text_lower in ep_title.lower():
+                            display_text = f"Episode {episode['episode_num']}: {ep_title}"
+                            episode_entry = {
+                                "season": episode.get('season'),
+                                "episode_num": episode['episode_num'],
+                                "name": display_text,
+                                "url": f"{self.server}/series/{self.username}/{self.password}/{episode['id']}.{episode.get('container_extension', 'm3u8')}",
+                                "title": ep_title
+                            }
+                            item = QListWidgetItem(display_text)
+                            item.setData(Qt.UserRole, episode_entry)
+                            item.setData(ROLE_STARRABLE, True)
+                            item.setIcon(self.series_channel_icon)
+                            filtered_items.append(item)
 
-        # 3) After building 'filtered_items', decide what to show
-        if not filtered_items:
-            # No results => show "Not Found"
-            not_found_item = QListWidgetItem("Not Found")
-            not_found_item.setFlags(not_found_item.flags() & ~Qt.ItemIsSelectable & ~Qt.ItemIsEnabled)
-            list_widget.addItem(not_found_item)
-        else:
-            # Sort them by text if you like
-            filtered_items.sort(key=lambda x: x.text().lower())
-            for item in filtered_items:
-                list_widget.addItem(item)
+            # 3) After building 'filtered_items', decide what to show
+            if not filtered_items:
+                not_found_item = QListWidgetItem("Not Found")
+                not_found_item.setFlags(not_found_item.flags() & ~Qt.ItemIsSelectable & ~Qt.ItemIsEnabled)
+                list_widget.addItem(not_found_item)
+            else:
+                filtered_items.sort(key=lambda x: x.text().lower())
+                for item in filtered_items:
+                    list_widget.addItem(item)
+        finally:
+            list_widget.setUpdatesEnabled(True)
 
 
     def get_list_widget(self, tab_name):
         return self.list_widgets.get(tab_name)
+
+    DEFAULT_PLAYER_PATHS = [
+        r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+        "/Applications/VLC.app/Contents/MacOS/VLC",
+        "/usr/bin/vlc",
+        "/usr/local/bin/vlc",
+        "/snap/bin/vlc",
+    ]
 
     def load_external_player_command(self):
         config = configparser.ConfigParser()
         config.read('config.ini')
         if 'ExternalPlayer' in config:
             self.external_player_command = config['ExternalPlayer'].get('Command', '')
+        if not self.external_player_command:
+            for path in self.DEFAULT_PLAYER_PATHS:
+                if os.path.isfile(path):
+                    self.external_player_command = path
+                    break
 
     def save_external_player_command(self):
         config = configparser.ConfigParser()
@@ -2129,17 +3070,233 @@ class IPTVPlayerApp(QMainWindow):
         with open('config.ini', 'w') as config_file:
             config.write(config_file)
 
-    def on_epg_checkbox_toggled(self, state):
-        # If EPG is checked after we already logged in and no EPG data loaded, start it now.
-        if state == Qt.Checked:
-            if self.login_type == 'xtream' and self.server and self.username and self.password and not self.epg_data:
-                # Reset progress and load EPG
-                self.reset_progress_bar()
-                self.animate_progress(0, 50, "Loading EPG data...")
-                self.load_epg_data_async()
+    # -- Favorites -----------------------------------------------------
 
-    def open_address_book(self):
-        dialog = AddressBookDialog(self)
+    def _rebuild_fav_index(self):
+        self._fav_url_index = {}
+
+        def visit(node):
+            if node.get("type") == "entry":
+                url = (node.get("entry") or {}).get("url")
+                if url:
+                    self._fav_url_index[url] = node["id"]
+
+        _walk_tree(self._favorites_tree["root"], visit)
+
+    def is_favorited(self, url):
+        return bool(url) and url in self._fav_url_index
+
+    def _repaint_main_lists(self):
+        for w in (self.channel_list_live, self.channel_list_movies, self.channel_list_series):
+            w.viewport().update()
+
+    def toggle_favorite(self, entry, source_tab):
+        if not self._active_profile_name:
+            self.animate_progress(0, 100, "Select a profile first")
+            return
+        url = (entry or {}).get("url")
+        if not url:
+            return
+        existing = self._fav_url_index.get(url)
+        if existing:
+            _remove_node(self._favorites_tree["root"], existing)
+        else:
+            node = {
+                "id": str(uuid.uuid4()),
+                "type": "entry",
+                "source_tab": source_tab,
+                "entry": dict(entry),
+            }
+            self._favorites_tree["root"]["children"].append(node)
+        self._rebuild_fav_index()
+        self.save_favorites()
+        self.favorites_tab.refresh()
+        self._repaint_main_lists()
+
+    def remove_favorite(self, node_id):
+        _remove_node(self._favorites_tree["root"], node_id)
+        self._rebuild_fav_index()
+        self.save_favorites()
+        self.favorites_tab.refresh()
+        self._repaint_main_lists()
+
+    def add_group(self, parent_id, name):
+        found = _find_node(self._favorites_tree["root"], parent_id)
+        if found is None or found[1].get("type") != "group":
+            return
+        group = {
+            "id": str(uuid.uuid4()),
+            "type": "group",
+            "name": name,
+            "children": [],
+        }
+        found[1]["children"].append(group)
+        self.save_favorites()
+        self.favorites_tab.refresh()
+
+    def rename_node(self, node_id, new_name):
+        found = _find_node(self._favorites_tree["root"], node_id)
+        if found is None:
+            return
+        if found[1].get("type") == "group":
+            found[1]["name"] = new_name
+        else:
+            found[1].setdefault("entry", {})["name"] = new_name
+        self.save_favorites()
+        self.favorites_tab.refresh()
+
+    def delete_node(self, node_id):
+        node = _remove_node(self._favorites_tree["root"], node_id)
+        if node is None:
+            return
+        self._rebuild_fav_index()
+        self.save_favorites()
+        self.favorites_tab.refresh()
+        self._repaint_main_lists()
+
+    def move_node(self, node_id, new_parent_id, new_index):
+        node = _remove_node(self._favorites_tree["root"], node_id)
+        if node is None:
+            return
+        target = _find_node(self._favorites_tree["root"], new_parent_id)
+        if target is None or target[1].get("type") != "group":
+            # Fall back: append to root
+            self._favorites_tree["root"]["children"].append(node)
+        else:
+            children = target[1]["children"]
+            new_index = max(0, min(new_index, len(children)))
+            children.insert(new_index, node)
+        self._rebuild_fav_index()
+        self.save_favorites()
+        self.favorites_tab.refresh()
+
+    def save_favorites(self):
+        if not self._active_profile_name:
+            return
+        try:
+            _atomic_write_json(_favorites_file_for(self._active_profile_name), self._favorites_tree)
+        except Exception as e:
+            print(f"Error saving favorites: {e}")
+
+    def load_favorites_for_profile(self, name):
+        path = _favorites_file_for(name)
+        if path.exists():
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    self._favorites_tree = json.load(f)
+                if not isinstance(self._favorites_tree, dict) or "root" not in self._favorites_tree:
+                    raise ValueError("invalid favorites file")
+            except Exception as e:
+                print(f"Error loading favorites for '{name}': {e}")
+                self._favorites_tree = _empty_favorites_tree()
+        else:
+            self._favorites_tree = _empty_favorites_tree()
+        self._rebuild_fav_index()
+
+    def save_last_profile(self, name):
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        if 'LastProfile' not in config:
+            config['LastProfile'] = {}
+        config['LastProfile']['Name'] = name
+        with open('config.ini', 'w') as config_file:
+            config.write(config_file)
+
+    def load_last_profile_name(self):
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        if 'LastProfile' in config:
+            return config['LastProfile'].get('Name', '').strip() or None
+        return None
+
+    def load_profile_by_name(self, name):
+        if not name:
+            return False
+        config = configparser.ConfigParser()
+        config.read('credentials.ini')
+        if 'Credentials' not in config or name not in config['Credentials']:
+            return False
+        data = config['Credentials'][name]
+        try:
+            if data.startswith('manual|'):
+                _, server, username, password = data.split('|')
+                self.server_entry.setText(server)
+                self.username_entry.setText(username)
+                self.password_entry.setText(password)
+                self.login()
+            elif data.startswith('m3u_plus|'):
+                _, m3u_url = data.split('|', 1)
+                if not self.extract_credentials_from_m3u_plus_url(m3u_url):
+                    return False
+                self.login()
+            elif data.startswith('local_m3u|'):
+                _, file_path = data.split('|', 1)
+                self.load_local_m3u(file_path)
+            else:
+                return False
+        except Exception as e:
+            print(f"Error loading profile '{name}': {e}")
+            return False
+        self.save_last_profile(name)
+        self._active_profile_name = name
+        self.load_favorites_for_profile(name)
+        self.favorites_tab.refresh()
+        for w in (self.channel_list_live, self.channel_list_movies, self.channel_list_series):
+            w.viewport().update()
+        return True
+
+    def autoload_last_profile(self):
+        name = self.load_last_profile_name()
+        if not name:
+            return
+        QTimer.singleShot(0, lambda: self.load_profile_by_name(name))
+
+    def on_epg_checkbox_toggled(self, state):
+        enabled = (state == Qt.Checked)
+        # Persist preference so the next launch restores it.
+        self.save_epg_enabled(enabled)
+        if enabled:
+            if self.login_type == 'xtream' and self.server and self.username and self.password:
+                if not self.epg_data:
+                    self.reset_progress_bar()
+                    self.animate_progress(0, 50, "Loading EPG data...")
+                    self.load_epg_data_async()
+                if hasattr(self, '_epg_refresh_timer') and not self._epg_refresh_timer.isActive():
+                    self._epg_refresh_timer.start()
+            elif self.login_type == 'local_m3u':
+                self.animate_progress(0, 100, "EPG not available for local M3U")
+        else:
+            if hasattr(self, '_epg_refresh_timer'):
+                self._epg_refresh_timer.stop()
+
+    def save_epg_enabled(self, enabled):
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        if 'EPG' not in config:
+            config['EPG'] = {}
+        config['EPG']['Enabled'] = str(bool(enabled))
+        with open('config.ini', 'w') as f:
+            config.write(f)
+
+    def load_epg_enabled(self):
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        if 'EPG' in config:
+            return config['EPG'].getboolean('Enabled', fallback=False)
+        return False
+
+    def _on_epg_refresh_tick(self):
+        # Background refresh: only meaningful for xtream profiles with EPG enabled.
+        if not (self.epg_checkbox.isChecked()
+                and self.login_type == 'xtream'
+                and self.server and self.username and self.password):
+            return
+        # Worker re-uses the cache if it's still inside EPG_CACHE_TTL_SECONDS,
+        # otherwise re-downloads. No status spam on success/no-op.
+        self.load_epg_data_async()
+
+    def open_profiles(self):
+        dialog = ProfilesDialog(self)
         dialog.exec_()
 
 def main():

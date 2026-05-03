@@ -20,3 +20,19 @@ Donations Appreciated: https://ko-fi.com/maiwand
 - **Recommended Player:** For optimal performance, use SMPlayer player. Download it at: https://www.smplayer.info
 
 <img width="752" height="555" alt="image" src="https://github.com/user-attachments/assets/3491cf63-497e-4aae-8a72-da63b69b480d" />
+
+
+# Build:
+:: Find and kill any running instance
+tasklist | findstr /I XtremeIPTV
+taskkill /F /IM XtremeIPTVPlayer.exe
+
+:: Wipe artifacts and rebuild
+rmdir /s /q build dist
+del XtremeIPTVPlayer.spec
+
+pyinstaller --noconfirm --windowed --onefile ^
+  --name "XtremeIPTVPlayer" ^
+  --collect-all qdarkstyle ^
+  --hidden-import lxml._elementpath ^
+  "XTREME IPTV PLAYER BY MY-1 v4.0.py"
